@@ -21,7 +21,7 @@ The inventory summary shows fractures, splints, and tourniquet status and time r
 
 ## Install
 
-Install the finished ZIP as one MO2 entry after item rebalance patches. Replace the previous Field Medical preview when upgrading. The addon reuses existing treatment items, animations, doctor actions, and sleeping mechanics. Its additive patches supply a basic field splint and an alternate tourniquet for profiles without existing ones. Unholy's Stock Prices Mod can set the doctor's fees while Field Medical handles the treatment.
+Install the finished ZIP as one MO2 entry after item rebalance patches. Replace the previous Field Medical preview when upgrading. The addon reuses existing treatment items, animations, doctor actions, and sleeping mechanics. Its additive patches supply a basic field splint and an alternate tourniquet for profiles without existing ones. Unholy's Trilogy Economy Mod can set the doctor's fees while Field Medical handles the treatment.
 
 | Game | Installation | Verification |
 | --- | --- | --- |
