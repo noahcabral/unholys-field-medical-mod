@@ -6,6 +6,8 @@ Field Medical is one standalone S.T.A.L.K.E.R. addon for blood loss, fractures, 
 
 *A medkit temporarily stabilizes wounds in the Great Swamps on Romeo DX11.*
 
+[Downloads and release notes](https://github.com/noahcabral/unholys-field-medical-mod/releases)
+
 ## Treatment
 
 - A bandage slows the worst undressed wound. The wound continues to bleed.
