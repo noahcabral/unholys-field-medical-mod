@@ -1,0 +1,737 @@
+-- Single-player adapter for callback-capable X-Ray Monolith executables.
+local save_key = "field_medical_blood_v1"
+local fracture_save_key = "field_medical_fractures_v1"
+local tourniquet_save_key = "field_medical_tourniquet_v1"
+local config_path = "field_medical\\settings.ltx"
+local config, ini, native_ini, medicine
+local doctor_fees
+local patient, patient_id, loaded, last_update
+local fractures, loaded_fractures
+local tourniquets, tourniquet_config, loaded_tourniquets
+local catalog, catalog_loaded, catalog_installed
+local impacts, before = {}, {}
+local disabled, warned_unknown, vision_active, unconscious
+local movement, recoil, zoom_recoil
+local combat_keys = {}
+
+local function log(text)
+    printf("[Field Medical] %s", text)
+end
+
+local function hint(text)
+    if actor_menu and actor_menu.set_msg then actor_menu.set_msg(1, text, 5) end
+end
+
+local function method(object, name)
+    if not object then return nil end
+    local ok, member = pcall(function() return object[name] end)
+    if ok and type(member) == "function" then return member end
+end
+
+local function setting(section, key)
+    if native_ini:section_exist(section) and native_ini:line_exist(section, key) then
+        return native_ini:r_float(section, key)
+    end
+end
+
+local function in_multiplayer()
+    return XrrSessionActive == true
+        or (type(XrrWillHost) == "function" and XrrWillHost())
+        or (type(XrrIsConnected) == "function" and XrrIsConnected())
+end
+
+local function read_config()
+    ini = ini_file(config_path)
+    native_ini = system_ini()
+    local value = {}
+    for _, key in ipairs({
+        "severe_hit_power", "minimum_bleed", "severe_bleed", "bleed_exponent",
+        "max_total_bleed", "bandage_bleed_fraction", "stabilization_seconds",
+        "medkit_minimum_units", "medkit_severity_units", "medkit_default_capacity", "epinephrine_seconds",
+        "rest_blood_per_hour", "minimum_rest_fraction", "recovery_cap_with_wounds",
+        "max_sleep_hours", "sleep_bleed_seconds_per_hour", "unknown_nutrition",
+        "unknown_hydration", "nutrition_weight", "hydration_weight",
+        "impairment_starts_at", "faint_at", "faint_seconds", "stamina_penalty",
+        "movement_penalty", "recoil_penalty", "vision_penalty",
+    }) do
+        value[key] = ini:r_float("blood", key)
+        assert(value[key] >= 0 and value[key] < math.huge, "invalid blood setting " .. key)
+    end
+    for _, key in ipairs({
+        "bandage_bleed_fraction", "minimum_rest_fraction", "recovery_cap_with_wounds",
+        "unknown_nutrition", "unknown_hydration", "impairment_starts_at", "faint_at",
+        "stamina_penalty", "movement_penalty", "vision_penalty",
+    }) do assert(value[key] <= 1, "expected a 0-1 value for " .. key) end
+    assert(value.impairment_starts_at > value.faint_at and value.severe_hit_power > 0
+        and value.stabilization_seconds > 0 and value.sleep_bleed_seconds_per_hour > 0
+        and value.nutrition_weight + value.hydration_weight > 0
+        and value.bandage_bleed_fraction > 0 and value.bandage_bleed_fraction < 1,
+        "invalid thresholds, treatment duration, or recovery weights")
+    for _, key in ipairs({
+        "update_interval_milliseconds", "max_tick_seconds", "bullet_memory_milliseconds",
+        "doctor_injury_fee", "doctor_injury_radiation_fee", "vision_effector_id",
+    }) do
+        value[key] = ini:r_float("monolith", key)
+        assert(value[key] >= 0 and value[key] < math.huge, "invalid adapter setting " .. key)
+    end
+    assert(value.update_interval_milliseconds > 0 and value.max_tick_seconds > 0
+        and value.bullet_memory_milliseconds > 0, "update and cache durations must be positive")
+    value.vision_effector = ini:r_string("monolith", "vision_effector")
+    value.combat_input_block = ini:r_bool("monolith", "combat_input_block")
+    medicine = {}
+    local roles = {"bandages", "medkits"}
+    if ini:r_bool("catalog", "enabled") then roles[#roles + 1] = "epinephrine" end
+    if ini:r_bool("tourniquet", "enabled") then roles[#roles + 1] = "tourniquets" end
+    for _, section in ipairs(roles) do
+        for row = 0, ini:line_count(section) - 1 do
+            local ok, item = ini:r_line(section, row, "", "")
+            local capacity = ok and section == "medkits" and ini:r_float(section, item)
+            if ok and (capacity and capacity > 0 or not capacity and ini:r_bool(section, item))
+                and native_ini:section_exist(item) then
+                for _, effect in ipairs({
+                    "eat_health", "wounds_heal_perc", "boost_health_restore", "boost_bleeding_restore",
+                }) do
+                    assert((setting(item, effect) or 0) == 0,
+                        item .. " still has native " .. effect .. "; check DLTX and load order")
+                end
+                assert(not medicine[item], item .. " is configured as two medical item types")
+                assert(not capacity or (capacity > 0 and capacity < math.huge),
+                    item .. " has invalid medkit capacity")
+                medicine[item] = {role = section, capacity = capacity}
+            end
+        end
+    end
+    assert(next(medicine), "no compatible medical item sections were found")
+    if ini:r_bool("tourniquet", "enabled") then
+        tourniquet_config = {}
+        for _, key in ipairs({
+            "duration_seconds", "arm_blood_fraction", "leg_blood_fraction",
+            "arm_integrity_loss_per_second", "leg_integrity_loss_per_second", "active_minimum_effect",
+            "leg_movement_penalty", "leg_limp_power", "arm_sway_penalty", "arm_reload_penalty",
+            "remove_scan_code", "modifier_scan_code",
+        }) do tourniquet_config[key] = ini:r_float("tourniquet", key) end
+    end
+    return value
+end
+
+local function same_number(a, b)
+    return type(a) == "number" and type(b) == "number"
+        and math.abs(a - b) <= 0.0001 * math.max(1, math.abs(b))
+end
+
+local function release_multiplier(record)
+    if record then
+        local ok, value = pcall(record.get, record.target)
+        if ok and same_number(value, record.applied) then
+            pcall(record.set, record.target, record.base)
+        end
+    end
+end
+
+local function multiply(record, target, get_name, set_name, scale)
+    if record and (record.target ~= target or scale == 1) then
+        release_multiplier(record)
+        record = nil
+    end
+    if scale == 1 then return nil end
+    local get, set = method(target, get_name), method(target, set_name)
+    if not get or not set then return nil end
+    local ok, current = pcall(get, target)
+    if not ok or type(current) ~= "number" then return nil end
+    local base = record and same_number(current, record.applied) and record.base or current
+    local applied = base * scale
+    if pcall(set, target, applied) then
+        return {target = target, base = base, applied = applied, get = get, set = set}
+    end
+end
+
+local function clear_effects()
+    release_multiplier(movement)
+    release_multiplier(recoil)
+    release_multiplier(zoom_recoil)
+    movement, recoil, zoom_recoil, unconscious = nil, nil, nil, false
+    if vision_active then
+        level.remove_pp_effector(config.vision_effector_id)
+        vision_active = nil
+    end
+    if fractures then fractures:clear_effects() end
+end
+
+local function check_known_conflicts()
+    local grok = grok_actor_damage_balancer
+    if grok and grok.on_game_start and grok.shit_booster then
+        return "Grok Actor Damage Balancer is installed and bypasses the native hit callback"
+    end
+    local body_health = zzz_player_injuries
+    if body_health and body_health.on_game_start and body_health.recieved_damage then
+        return "Body Health System or its Direct Limb Healing fork is installed"
+    end
+end
+
+local function actor_state()
+    if not config or disabled or not db or not db.actor or in_multiplayer() then return nil end
+    local actor = db.actor
+    if not actor:alive() then return nil end
+    if not patient or patient_id ~= actor:id() then
+        if not method(actor, "max_health") or not same_number(actor:max_health(), 1)
+            or type(actor.health) ~= "number" or actor.health <= 0 or actor.health > 1 then
+            disabled = true
+            log("disabled: the adapter requires the native 0-1 actor health scale")
+            return nil
+        end
+        local cast = method(actor, "cast_Actor")
+        local native_actor = cast and cast(actor)
+        local get_conditions = method(native_actor, "conditions")
+        local conditions = get_conditions and get_conditions(native_actor)
+        if not method(actor, "set_health_ex") or not method(conditions, "ClearWounds") then
+            disabled = true
+            log("disabled: this executable lacks actor conditions, SetHealthEx, or ClearWounds")
+            return nil
+        end
+        if patient_id and patient_id ~= actor:id() then
+            clear_effects()
+            impacts, before = {}, {}
+        end
+        patient_id = actor:id()
+        patient = field_medical_model.new(config, actor.health, loaded)
+        if tourniquet_config then
+            tourniquets = field_medical_tourniquet.new(tourniquet_config, loaded_tourniquets)
+            loaded_tourniquets = nil
+        end
+        if fractures then
+            fractures:bind(actor, loaded_fractures, tourniquets, patient)
+            if fractures.enabled then loaded_fractures = nil end
+        end
+        loaded = nil
+        last_update = time_global()
+        conditions:ClearWounds()
+        -- The archived addon state takes precedence over capped native save values.
+        if not same_number(actor.health, patient.blood) then actor:set_health_ex(patient.blood) end
+    end
+    return actor, patient
+end
+
+local function apply_power(conditions, effect, fracture_effect)
+    if not method(conditions, "SetPower") or not method(conditions, "GetPower") then return end
+    local cap = method(conditions, "GetMaxPower") and conditions:GetMaxPower() or 1
+    local reduced = effect.unconscious and 0 or cap * effect.stamina
+    if fracture_effect then
+        fractures:apply_power(conditions, reduced * fracture_effect.stamina, fracture_effect.regeneration)
+    elseif conditions:GetPower() > reduced then
+        conditions:SetPower(reduced)
+    end
+end
+
+local function apply_effects(actor, state)
+    local effect = state:effects()
+    local conditions = actor:cast_Actor():conditions()
+    local fracture_effect = fractures and fractures:effects()
+    if not fracture_effect then apply_power(conditions, effect) end
+    local walk = effect.movement * (fracture_effect and fracture_effect.movement or 1)
+    movement = multiply(movement, actor, "get_actor_walk_accel", "set_actor_walk_accel", walk)
+    local item = actor:active_item()
+    local weapon = item and method(item, "cast_Weapon") and item:cast_Weapon()
+    recoil = multiply(recoil, weapon, "GetCamDispersion", "SetCamDispersion", effect.recoil)
+    zoom_recoil = multiply(zoom_recoil, weapon, "GetZoomCamDispersion", "SetZoomCamDispersion", effect.recoil)
+    if effect.unconscious and not unconscious then
+        hint("You blacked out from blood loss.")
+        if config.combat_input_block and bind_to_dik and level.release_action then
+            for binding in pairs(combat_keys) do
+                local key = bind_to_dik(binding)
+                if key ~= 0 then level.release_action(key) end
+            end
+        end
+    end
+    unconscious = effect.unconscious
+    local factor = unconscious and 1 or effect.vision
+    if factor > 0 and level.add_pp_effector and level.set_pp_effector_factor and level.remove_pp_effector then
+        if not vision_active then
+            level.add_pp_effector(config.vision_effector, config.vision_effector_id, true)
+            vision_active = true
+        end
+        level.set_pp_effector_factor(config.vision_effector_id, factor)
+    elseif vision_active then
+        level.remove_pp_effector(config.vision_effector_id)
+        vision_active = nil
+    end
+end
+
+local function synchronize(actor, state)
+    local conditions = actor:cast_Actor():conditions()
+    -- Never leave an engine wound running in parallel with model bleeding.
+    if not method(conditions, "BleedingSpeed") or conditions:BleedingSpeed() > 0 then
+        conditions:ClearWounds()
+    end
+    if (state.blood == 0 and actor.health > 0) or not same_number(actor.health, state.blood) then
+        actor:set_health_ex(state.blood)
+    end
+end
+
+local function update()
+    local actor, state = actor_state()
+    if not actor then
+        if movement or recoil or zoom_recoil or vision_active or unconscious
+            or (fractures and (fractures.sprint_block or fractures.sway_active or fractures.limp_until
+                or fractures.inventory_open or fractures.last_power)) then clear_effects() end
+        return
+    end
+    state:observe_health(actor.health)
+    local now = time_global()
+    if now < last_update then last_update = now end
+    local elapsed = now - last_update
+    if elapsed >= config.update_interval_milliseconds then
+        last_update = now
+        local was_stable = state:bleeding_rate(tourniquets) == 0
+        local previous_expiry = tourniquets and tourniquets:next_expiry()
+        local seconds = math.min(elapsed / 1000, config.max_tick_seconds)
+        state:tick(seconds, tourniquets)
+        if previous_expiry and previous_expiry <= seconds and state.blood > 0 then
+            hint("A tourniquet expired. Treat the bleeding and see a doctor for the limb.")
+        elseif was_stable and state:bleeding_rate(tourniquets) > 0 and state.blood > 0 then
+            hint("A wound reopened. Rebandage it before using another medkit.")
+        end
+        for id, record in pairs(impacts) do
+            if now - record.time > config.bullet_memory_milliseconds then impacts[id] = nil end
+        end
+        for id, record in pairs(before) do
+            if now - record.time > config.bullet_memory_milliseconds then before[id] = nil end
+        end
+        if state.blood > 0 then apply_effects(actor, state) end
+    end
+    if fractures and state.blood > 0 then
+        apply_power(actor:cast_Actor():conditions(), state:effects(), fractures:combined_effects())
+    end
+    synchronize(actor, state)
+end
+
+local function impact(bullet)
+    local actor = actor_state()
+    if not actor or bullet.target_id ~= actor:id() or type(bullet.bullet_id) ~= "number"
+        or type(bullet.weapon_id) ~= "number" or type(bullet.section) ~= "string" then return end
+    local weapon = level.object_by_id(bullet.weapon_id)
+    local ap = setting(bullet.section, "k_ap")
+    if not weapon or not ap or ap < 0 then return end
+    local modifier = setting(weapon:section(), "ap_modifier") or 1
+    if modifier < 0 then return end
+    impacts[bullet.bullet_id] = {ap = ap * modifier, time = time_global()}
+end
+
+local function protection(item, cast_name, bone)
+    if not item then return 0 end
+    local cast = method(item, cast_name)
+    if not cast or type(bone) ~= "number" or bone < 0 or bone == 65535 then return nil end
+    local armor = cast(item)
+    if not method(armor, "GetBoneArmor") then return nil end
+    local threshold = armor:GetBoneArmor(bone) * item:condition()
+    if threshold <= 0 then return 0 end
+    local section = item:section()
+    if setting(section, "fire_wound_param_1") then
+        local alternative = setting(section, "fire_wound_param_2")
+        if alternative then
+            if alternative <= 0 then return nil end
+            threshold = threshold / alternative
+        end
+    end
+    return threshold
+end
+
+local function before_hit(hit_data, bone, flags)
+    local actor = actor_state()
+    if not actor or hit_data.type ~= hit.fire_wound or type(hit_data.bullet_id) ~= "number"
+        or (flags and flags.ret_value == false) then return end
+    -- Native armor degrades during ConditionHit. Sample its pre-impact condition.
+    before[hit_data.bullet_id] = {
+        outfit = protection(actor:item_in_slot(7), "cast_CustomOutfit", bone),
+        helmet = protection(actor:item_in_slot(12), "cast_Helmet", bone),
+        raw_power = hit_data.power,
+        time = time_global(),
+    }
+end
+
+local function classify_bullet(actor, hit_data)
+    if not actor:item_in_slot(7) and not actor:item_in_slot(12) then return "penetrated" end
+    local id = hit_data.bullet_id
+    local armor, round = before[id], impacts[id]
+    if not armor or armor.outfit == nil or armor.helmet == nil then return "unknown" end
+    local required = math.max(armor.outfit, armor.helmet)
+    if required == 0 then return "penetrated" end
+    if not round then return "unknown" end
+    return round.ap <= required and "stopped" or "penetrated"
+end
+
+local function after_calcs(hit_data, target, bone)
+    local actor, state = actor_state()
+    if not actor or not target or target:id() ~= actor:id() then return end
+    local kind = hit_data.type
+    local id = hit_data.bullet_id
+    local armor = id and before[id]
+    local outcome
+    if kind == hit.fire_wound then
+        outcome = classify_bullet(actor, hit_data)
+        if id then before[id], impacts[id] = nil, nil end
+    end
+    local part = fractures and fractures:part(actor, bone)
+    if fractures then fractures:hit(actor, hit_data, part, outcome, armor and armor.raw_power) end
+    if hit_data.power <= 0 or (kind ~= hit.fire_wound and kind ~= hit.wound
+        and (not hit.wound_2 or kind ~= hit.wound_2)) then return end
+    if outcome == "unknown" then
+        if not warned_unknown then
+            log("armor penetration could not be resolved for a round; keeping its vanilla impact damage")
+            warned_unknown = true
+        end
+        return
+    end
+    state:penetrating_hit(hit_data.power, outcome or "penetrated", part)
+    -- The native armor calculation and its durability cost already ran.
+    -- Accepted wounds replace HP loss here, before it can kill the actor.
+    hit_data.power = 0
+end
+
+local function tourniquet_target(state)
+    if not tourniquets then return nil end
+    local worst
+    for _, wound in ipairs(state.wounds) do
+        if wound.treatment ~= "stable" and tourniquets:can_apply(wound.part, state.blood)
+            and (not worst or wound.severity > worst.severity) then worst = wound end
+    end
+    return worst and worst.part
+end
+
+local function permit_use(item)
+    local _, state = actor_state()
+    if not state then return true end
+    if fractures and not fractures:can_use(item) then return false end
+    local treatment = medicine[item:section()]
+    if treatment and treatment.role == "tourniquets" and not tourniquet_target(state) then
+        hint("No bleeding limb can use a tourniquet.")
+        return false
+    end
+    return true
+end
+
+local function modifier_pressed()
+    local pressed = key_state and key_state(tourniquet_config.modifier_scan_code)
+    return pressed == true or (type(pressed) == "number" and pressed ~= 0)
+end
+
+local function remove_tourniquet()
+    local actor = actor_state()
+    if not actor or not tourniquets then return false end
+    local target
+    for _, injury in ipairs(tourniquets:status()) do
+        if injury.active and (not target or injury.remaining < target.remaining) then target = injury end
+    end
+    if target and tourniquets:remove(target.part) then
+        hint("Tourniquet removed. Treat any bleeding and see a doctor for the limb.")
+        return true
+    end
+    return false
+end
+
+local function used(item)
+    local actor, state = actor_state()
+    if state and fractures then fractures:use(item) end
+    local treatment = item and medicine[item:section()]
+    if not state or not treatment then return end
+    if treatment.role == "bandages" then
+        if state:bandage() > 0 then hint("Bandaged. The wound is still bleeding slowly.") end
+    elseif treatment.role == "medkits" then
+        local finished, applied = state:medkit(treatment.capacity)
+        if finished > 0 then
+            hint("Wounds stabilized temporarily.")
+        elseif applied > 0 then
+            hint("Treatment started. Another medkit can finish stabilizing the wound.")
+        elseif state:bleeding_rate(tourniquets) > 0 then
+            hint("Rebandage reopened wounds before using a medkit.")
+        end
+    elseif treatment.role == "epinephrine" then
+        state:epinephrine()
+        hint("Epinephrine temporarily suppresses blood-loss symptoms.")
+    elseif treatment.role == "tourniquets" then
+        local part = tourniquet_target(state)
+        local penalty = part and tourniquets:apply(part, state.blood)
+        if penalty then
+            state:deduct_blood(penalty)
+            synchronize(actor, state)
+            hint("Tourniquet applied. Use Left Alt + T to remove the one closest to expiry.")
+        end
+    end
+    if fractures then fractures:refresh_status() end
+end
+
+local function slept(hours)
+    local actor, state = actor_state()
+    if not actor then return end
+    state:observe_health(actor.health)
+    local conditions = actor:cast_Actor():conditions()
+    local nutrition = method(conditions, "GetSatiety") and conditions:GetSatiety()
+    local water
+    if actor_status_thirst and actor_status_thirst.get_water_deprivation then
+        local deprivation = actor_status_thirst.get_water_deprivation(false)
+        if type(deprivation) == "number" then water = 1 - deprivation end
+    end
+    state:sleep(hours, nutrition, water, tourniquets)
+    synchronize(actor, state)
+end
+
+local function install_doctors()
+    local old = {
+        injured = dialogs.is_actor_injured,
+        combined = dialogs.is_actor_injured_irradiated,
+        not_healthy = dialogs.is_actor_not_healthy,
+        heal = dialogs.heal_actor_injury,
+        heal_combined = dialogs.heal_actor_injury_radiation,
+    }
+    local function injured(state)
+        return #state.wounds > 0 or (fractures and fractures.state:needs_doctor())
+            or (tourniquets and next(tourniquets.injuries) ~= nil) or false
+    end
+    local function eligible(fallback, fee, radiation, first, second)
+        local actor, state = actor_state()
+        if not actor then return fallback(first, second) end
+        return injured(state) and actor:money() >= fee and (not radiation or actor.radiation > 0)
+    end
+    local function treat(fallback, fee, radiation, first, second)
+        local actor, state = actor_state()
+        if not actor then return fallback(first, second) end
+        if not injured(state) or actor:money() < fee then return end
+        if fee > 0 then dialogs.relocate_money_from_actor(first, second, fee) end
+        if radiation then actor.radiation = 0 end
+        local had_wounds = #state.wounds > 0
+        local had_injuries = (fractures and fractures.state:needs_doctor())
+            or (tourniquets and next(tourniquets.injuries) ~= nil)
+        state:doctor()
+        if tourniquets then tourniquets:doctor() end
+        if fractures then fractures:doctor() end
+        if had_wounds and had_injuries then
+            hint("Wounds closed and injuries treated. Rest to recover blood.")
+        elseif had_injuries then
+            hint("Injuries treated.")
+        elseif had_wounds then
+            hint("Wounds closed. Rest to recover blood.")
+        end
+    end
+    dialogs.is_actor_injured = function(first, second)
+        return eligible(old.injured, config.doctor_injury_fee, false, first, second)
+    end
+    dialogs.is_actor_injured_irradiated = function(first, second)
+        return eligible(old.combined, config.doctor_injury_radiation_fee, true, first, second)
+    end
+    dialogs.is_actor_not_healthy = function(first, second)
+        local actor, state = actor_state()
+        if not actor then return old.not_healthy(first, second) end
+        return injured(state) or actor.radiation > 0
+    end
+    dialogs.heal_actor_injury = function(first, second)
+        return treat(old.heal, config.doctor_injury_fee, false, first, second)
+    end
+    dialogs.heal_actor_injury_radiation = function(first, second)
+        return treat(old.heal_combined, config.doctor_injury_radiation_fee, true, first, second)
+    end
+end
+
+function set_doctor_fees(injury, combined)
+    doctor_fees = {injury = injury, combined = combined}
+    if not config then return false end
+    config.doctor_injury_fee = injury
+    config.doctor_injury_radiation_fee = combined
+    return true
+end
+
+local function catalog_actor()
+    return not in_multiplayer() and db and db.actor
+end
+
+local function load_catalog()
+    if catalog_loaded then return catalog end
+    catalog_loaded = true
+    local ok, value = pcall(function()
+        return field_medical_catalog_monolith.new(ini_file(config_path), system_ini(), catalog_actor,
+            function(item)
+                return not config or disabled or permit_use(item)
+            end, hint, log)
+    end)
+    if ok then catalog = value
+    else log("catalog disabled: " .. tostring(value)) end
+    return catalog
+end
+
+-- These predicates run at source sites before the engine selects or spawns an
+-- item. New Game has no actor yet. World supply stays scoped to solo play.
+function allow_starting_item(section)
+    local policy = load_catalog()
+    return not policy or not policy:is_blocked(section)
+end
+
+function allow_generated_item(section)
+    return not catalog_actor() or allow_starting_item(section)
+end
+
+function filter_fetch_candidates(pool)
+    return field_medical_fetch_monolith.filter_candidates(load_catalog(), pool)
+end
+
+function prepare_fetch_offer(actor, key, offer)
+    return field_medical_fetch_monolith.prepare_offer(load_catalog(), actor, key, offer)
+end
+
+function clear_fetch_reward(actor, key)
+    field_medical_fetch_monolith.clear_reward(load_catalog(), actor, key)
+end
+
+function normalize_fetch_requirement(actor, key)
+    return field_medical_fetch_monolith.normalize_requirement(load_catalog(), actor, key)
+end
+
+function fetch_reward_section(actor, key, section)
+    return field_medical_fetch_monolith.reward_section(load_catalog(), actor, key, section)
+end
+
+function fixed_quest_rewards(ini, id)
+    local rule = ini:r_string_ex(id, "on_complete")
+    if rule then
+        rule = field_medical_fetch_monolith.fixed_reward_rule(load_catalog(), id, rule)
+        return xr_logic.parse_condlist(nil, id, "on_complete", rule)
+    end
+end
+
+function normalize_medical_multifetch(id, record, saved)
+    field_medical_fetch_monolith.normalize_multifetch(load_catalog(), id, record, saved)
+end
+
+function medical_multifetch_options(actor, entries)
+    return field_medical_fetch_monolith.multifetch_options(actor, entries)
+end
+
+function medical_quest_offer_text(id, text)
+    return field_medical_fetch_monolith.quest_offer_text(load_catalog(), id, text)
+end
+
+local function install_catalog()
+    if catalog_installed or not RegisterScriptCallback or not load_catalog() then return end
+    catalog_installed = true
+    catalog:install_use_gate()
+    catalog:install_loadouts(ui_mm_faction_select and ui_mm_faction_select.UINewGame,
+        new_game_loadout_injector_mcm)
+    catalog:install_trade(utils_item, ui_inventory and ui_inventory.UIInventory, trader_autoinject)
+    catalog:install_loot(zml_loot)
+    catalog:install_random_rewards(xr_effects)
+    catalog:install_crafting(demonized_crafter)
+    RegisterScriptCallback("actor_on_first_update", function()
+        field_medical_fetch_monolith.migrate_accepted(catalog, db and db.actor)
+        if catalog_actor() then catalog:filter_crafting(demonized_crafter) end
+    end)
+    RegisterScriptCallback("actor_on_item_before_use", function(item, flags)
+        if flags and flags.ret_value ~= false and not catalog:can_use(item) then
+            flags.ret_value = false
+        end
+    end)
+    local function filter_npc_inventory(npc)
+        catalog:filter_npc_inventory(npc, alife_release_id, method, get_object_story_id)
+    end
+    local register_last = RegisterScriptCallbackPost or RegisterScriptCallback
+    register_last("npc_on_net_spawn", filter_npc_inventory)
+    register_last("npc_on_death_callback", filter_npc_inventory)
+    if trader_autoinject and trader_autoinject.timed_update then
+        register_last("trader_on_restock", filter_npc_inventory)
+    end
+    log("medical catalog registered")
+end
+
+function on_game_start()
+    install_catalog()
+    if config or disabled then return end
+    local conflict = check_known_conflicts()
+    if conflict then disabled = true; log("disabled: " .. conflict); return end
+    if not RegisterScriptCallback or not callbacks_gameobject or not CBeforeHitAfterCalcs
+        or not CBulletOnImpact or not hit or not hit.fire_wound or not hit.wound
+        or not dialogs or not dialogs.relocate_money_from_actor or not dialogs.is_actor_injured
+        or not dialogs.is_actor_injured_irradiated or not dialogs.is_actor_not_healthy
+        or not dialogs.heal_actor_injury or not dialogs.heal_actor_injury_radiation then
+        disabled = true
+        log("disabled: required Monolith callbacks or stock doctor actions are missing")
+        return
+    end
+    local ok, value = pcall(read_config)
+    if not ok then disabled = true; log("disabled: " .. tostring(value)); return end
+    config = value
+    if doctor_fees then set_doctor_fees(doctor_fees.injury, doctor_fees.combined) end
+    if tourniquet_config or (ini:section_exist("fractures") and ini:r_bool("fractures", "enabled")) then
+        local loaded_ok, extension = pcall(function()
+            return field_medical_fractures_monolith.new(ini, native_ini, medicine, method, hint,
+                tourniquet_config ~= nil)
+        end)
+        if loaded_ok then fractures = extension
+        else log("fractures disabled: " .. tostring(extension)) end
+    end
+    if key_bindings then
+        for _, name in ipairs({
+            "kFWD", "kBACK", "kL_STRAFE", "kR_STRAFE", "kLEFT", "kRIGHT",
+            "kJUMP", "kSPRINT_TOGGLE", "kACCEL", "kUSE", "kWPN_FIRE", "kWPN_ZOOM", "kWPN_RELOAD",
+        }) do
+            if key_bindings[name] then combat_keys[key_bindings[name]] = true end
+        end
+    end
+    install_doctors()
+    RegisterScriptCallback("bullet_on_impact", impact)
+    RegisterScriptCallback("actor_on_before_hit", before_hit)
+    RegisterScriptCallback("on_before_hit_after_calcs", after_calcs)
+    RegisterScriptCallback("actor_on_item_use", used)
+    RegisterScriptCallback("actor_on_sleep", slept)
+    RegisterScriptCallback("actor_on_update", update)
+    RegisterScriptCallback("on_before_key_press", function(scan, binding, _, flags)
+        if unconscious and config.combat_input_block and combat_keys[binding] then flags.ret_value = false end
+        if fractures and fractures.sprint_block and key_bindings and binding == key_bindings.kSPRINT_TOGGLE then
+            flags.ret_value = false
+        end
+        if tourniquet_config and scan == tourniquet_config.remove_scan_code
+            and modifier_pressed() and remove_tourniquet() then
+            flags.ret_value = false
+        end
+    end)
+    RegisterScriptCallback("on_before_mouse_move", function(_, _, _, flags)
+        if unconscious and config.combat_input_block then flags.ret_value = false end
+    end)
+    RegisterScriptCallback("save_state", function(data)
+        if not in_multiplayer() then
+            data[save_key] = patient and patient:snapshot() or loaded
+            data[fracture_save_key] = fractures and fractures.enabled and fractures.state
+                and fractures.state:snapshot() or loaded_fractures
+            data[tourniquet_save_key] = tourniquets and tourniquets:snapshot() or loaded_tourniquets
+        end
+    end)
+    RegisterScriptCallback("load_state", function(data)
+        clear_effects()
+        loaded, patient, patient_id, last_update = data[save_key], nil, nil, nil
+        loaded_fractures = data[fracture_save_key]
+        loaded_tourniquets, tourniquets = data[tourniquet_save_key], nil
+        if fractures then fractures.actor, fractures.state = nil, nil end
+        impacts, before = {}, {}
+    end)
+    if not catalog and (fractures or tourniquet_config) then
+        RegisterScriptCallback("actor_on_item_before_use", function(item, flags)
+            if item and flags.ret_value ~= false and actor_state() and not permit_use(item) then
+                flags.ret_value = false
+            end
+        end)
+    end
+    if fractures then
+        RegisterScriptCallback("actor_on_land", function(speed)
+            if actor_state() then fractures:land(speed) end
+        end)
+        RegisterScriptCallback("actor_on_footstep", function(_, _, hud_view)
+            if actor_state() then fractures:footstep(hud_view) end
+        end)
+        RegisterScriptCallback("actor_on_hud_animation_play", function(data, item)
+            if actor_state() then fractures:animation(data, item) end
+        end)
+        RegisterScriptCallback("ActorMenu_on_mode_changed", function(mode)
+            if actor_state() then fractures:menu(mode) end
+        end)
+        RegisterScriptCallback("actor_on_net_destroy", function()
+            clear_effects()
+            fractures:close_menu()
+        end)
+    end
+    log("solo adapter registered")
+end

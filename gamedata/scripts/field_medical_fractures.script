@@ -1,0 +1,119 @@
+-- Independent, deterministic fracture state. The caller owns events and time.
+local state = {}
+state.__index = state
+local parts = {"left_leg", "right_leg", "left_arm", "right_arm", "ribs"}
+local groups = {
+    left_leg = "leg", right_leg = "leg", left_arm = "arm", right_arm = "arm", ribs = "ribs",
+}
+
+local function clamp(value, lower, upper)
+    return math.max(lower, math.min(upper, value))
+end
+
+local function valid_number(value)
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+function new(config, archive)
+    local self = setmetatable({config = config, fractures = {}}, state)
+    if type(archive) ~= "table" or archive.version ~= 1 then return self end
+    for _, part in ipairs(parts) do
+        local injury = type(archive.fractures) == "table" and archive.fractures[part]
+        if type(injury) == "table" and valid_number(injury.severity) and injury.severity > 0 then
+            self.fractures[part] = {
+                severity = clamp(injury.severity, config.minimum_severity, 1),
+                splinted = part ~= "ribs" and injury.splinted == true,
+            }
+        end
+    end
+    return self
+end
+
+function state:snapshot()
+    local archive = {version = 1, fractures = {}}
+    for part, injury in pairs(self.fractures) do
+        archive.fractures[part] = {severity = injury.severity, splinted = injury.splinted}
+    end
+    return archive
+end
+
+function state:injure(part, cause, power, roll)
+    local config = self.config
+    local impact = config.causes[cause]
+    if not groups[part] or self.fractures[part] or not impact
+        or not valid_number(power) or power < impact.threshold or not valid_number(roll)
+        or roll < 0 or roll >= 1 then return false end
+    local strength = clamp((power - impact.threshold) / (impact.severe - impact.threshold), 0, 1)
+    local chance = impact.chance * (config.minimum_chance_fraction
+        + strength * (1 - config.minimum_chance_fraction))
+    if roll >= chance then return false end
+    self.fractures[part] = {
+        severity = config.minimum_severity + strength * (1 - config.minimum_severity),
+        splinted = false,
+    }
+    return true
+end
+
+function state:needs_doctor()
+    return next(self.fractures) ~= nil
+end
+
+function state:splint_target()
+    local target
+    for _, part in ipairs(parts) do
+        local injury = self.fractures[part]
+        if part ~= "ribs" and injury and not injury.splinted
+            and (not target or injury.severity > self.fractures[target].severity) then
+            target = part
+        end
+    end
+    return target
+end
+
+function state:splint()
+    local part = self:splint_target()
+    if part then self.fractures[part].splinted = true end
+    return part
+end
+
+function state:doctor()
+    self.fractures = {}
+end
+
+function state:status()
+    local injuries = {}
+    for _, part in ipairs(parts) do
+        local injury = self.fractures[part]
+        if injury then injuries[#injuries + 1] = {part = part, splinted = injury.splinted} end
+    end
+    return injuries
+end
+
+local function paired(left, right, second)
+    return math.min(1, math.max(left, right) + math.min(left, right) * second)
+end
+
+function state:effects()
+    local config = self.config
+    local function effective(part)
+        local injury = self.fractures[part]
+        if not injury then return 0 end
+        local support = injury.splinted and config.splinted_penalty_fraction or 1
+        return injury.severity * support
+    end
+    local left_leg, right_leg = effective("left_leg"), effective("right_leg")
+    local leg = paired(left_leg, right_leg, config.second_limb_fraction)
+    local arm = paired(effective("left_arm"), effective("right_arm"), config.second_limb_fraction)
+    local ribs = effective("ribs")
+    local left, right = self.fractures.left_leg, self.fractures.right_leg
+    return {
+        movement = 1 - leg * config.leg_movement_penalty,
+        sprint_block = (left and not left.splinted) == true or (right and not right.splinted) == true,
+        limp = math.max(left_leg, right_leg) * config.leg_limp_power,
+        limp_side = left_leg >= right_leg and "left" or "right",
+        sway = 1 + arm * config.arm_sway_penalty,
+        reload = 1 - arm * config.arm_reload_penalty,
+        stamina = 1 - ribs * config.ribs_stamina_penalty,
+        regeneration = 1 - ribs * config.ribs_regen_penalty,
+    }
+end

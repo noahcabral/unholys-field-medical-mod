@@ -1,0 +1,317 @@
+-- Monolith bindings for the optional fracture model.
+local adapter = {}
+adapter.__index = adapter
+local limb_names = {
+    thigh = "leg", calf = "leg", foot = "leg", toe = "leg",
+    clavicle = "arm", upperarm = "arm", forearm = "arm", hand = "arm", finger = "arm",
+}
+local model = field_medical_fractures
+
+local function number(ini, section, key, lower, upper)
+    local value = ini:r_float(section, key)
+    assert(value >= lower and value <= upper, "invalid fracture setting " .. key)
+    return value
+end
+
+function new(ini, native, medicine, method, hint, tourniquet_enabled)
+    local enabled = ini:section_exist("fractures") and ini:r_bool("fractures", "enabled")
+    if not enabled and not tourniquet_enabled then return nil end
+    local config = {causes = {}}
+    for _, key in ipairs({
+        "minimum_chance_fraction", "second_limb_fraction", "splinted_penalty_fraction",
+        "leg_movement_penalty", "leg_limp_power", "arm_sway_penalty", "ribs_stamina_penalty",
+        "ribs_regen_penalty", "blocked_raw_power_fraction",
+    }) do config[key] = number(ini, "fractures", key, 0, 1) end
+    config.minimum_severity = number(ini, "fractures", "minimum_severity", 0.0001, 1)
+    config.arm_reload_penalty = number(ini, "fractures", "arm_reload_penalty", 0, 0.85)
+    config.limp_interval = number(ini, "fractures", "limp_interval_milliseconds", 300, 10000)
+    config.limp_effector = number(ini, "fractures", "limp_effector_id", 1, 2147483647)
+    for _, cause in ipairs({"fall", "penetrating", "blocked", "mutant", "blunt"}) do
+        local section = "fracture_" .. cause
+        local threshold = number(ini, section, "threshold", 0.001, 10000)
+        config.causes[cause] = {
+            threshold = threshold,
+            severe = number(ini, section, "severe", threshold + 0.0001, 10000),
+            chance = number(ini, section, "chance", 0, 1),
+        }
+    end
+    local treatments = {}
+    local section = "fracture_splints"
+    for row = 0, ini:line_count(section) - 1 do
+        local ok, item = ini:r_line(section, row, "", "")
+        if ok and ini:r_bool(section, item) and native:section_exist(item) then
+            assert(not medicine[item], item .. " has multiple medical roles")
+            for _, effect in ipairs({
+                "eat_health", "wounds_heal_perc", "boost_health_restore", "boost_bleeding_restore",
+            }) do
+                assert(not native:line_exist(item, effect) or native:r_float(item, effect) == 0,
+                    item .. " still has native " .. effect .. "; check DLTX and load order")
+            end
+            treatments[item] = true
+        end
+    end
+    assert(not enabled or next(treatments), "no usable splint section was found")
+    return setmetatable({
+        config = config, method = method, hint = hint, native = native, treatments = treatments,
+        enabled = enabled,
+    }, adapter)
+end
+
+function adapter:bind(actor, snapshot, tourniquets, blood_state)
+    self.actor = actor
+    self.state = model.new(self.config, self.enabled and snapshot or nil)
+    self.tourniquets, self.blood_state = tourniquets, blood_state
+    self:sprint(self:combined_effects().sprint_block)
+end
+
+local function translate(key, fallback)
+    if game and game.translate_string then
+        local localized = game.translate_string(key)
+        if localized and localized ~= key then return localized end
+    end
+    return fallback
+end
+
+local part_names = {
+    left_leg = "Left leg", right_leg = "Right leg",
+    left_arm = "Left arm", right_arm = "Right arm", ribs = "Ribs",
+}
+
+local function part_name(part)
+    return translate("st_field_medical_" .. part, part_names[part])
+end
+
+function adapter:status_text()
+    local injuries = self.state:status()
+    local entries, lines = {}, {}
+    for _, injury in ipairs(injuries) do
+        entries[#entries + 1] = part_name(injury.part) .. (injury.splinted
+            and translate("st_field_medical_splinted", " (splinted)") or "")
+    end
+    if #entries > 0 then
+        lines[#lines + 1] = translate("st_field_medical_fractures", "Fractures") .. "  " .. table.concat(entries, " / ")
+    end
+    for _, injury in ipairs(self.tourniquets and self.tourniquets:status() or {}) do
+        local detail = translate("st_field_medical_tourniquet_damage", "Tourniquet injury, see doctor")
+        if injury.active then
+            local seconds = math.ceil(injury.remaining)
+            detail = string.format("%s %d:%02d",
+                translate("st_field_medical_tourniquet", "Tourniquet"), math.floor(seconds / 60), seconds % 60)
+        end
+        lines[#lines + 1] = part_name(injury.part) .. "  " .. detail
+    end
+    if self.blood_state and self.blood_state.epinephrine_seconds > 0 then
+        lines[#lines + 1] = "Epinephrine active"
+    end
+    return table.concat(lines, "\n")
+end
+
+function adapter:menu(mode)
+    self.inventory_open = mode == 1
+    if self.inventory_open and not self.status_window and ActorMenu and ActorMenu.get_actor_menu
+        and CScriptXmlInit and getFS
+        and getFS():exist("$game_config$", "ui\\field_medical_fractures.xml") then
+        local parent = ActorMenu.get_actor_menu()
+        if parent then
+            local xml = CScriptXmlInit()
+            xml:ParseFile("field_medical_fractures.xml")
+            self.menu_window = parent
+            self.status_window = xml:InitTextWnd("summary", parent)
+        end
+    end
+    self:refresh_status()
+    if self.inventory_open and not self.status_window then
+        local status = self:status_text()
+        if status ~= "" then self.hint(status) end
+    end
+end
+
+function adapter:close_menu()
+    if self.menu_window and self.status_window then self.menu_window:DetachChild(self.status_window) end
+    self.menu_window, self.status_window, self.displayed_status = nil, nil, nil
+end
+
+function adapter:refresh_status()
+    if not self.status_window then return end
+    local status = self.inventory_open and self.state and self:status_text() or ""
+    if self.displayed_status ~= status then
+        self.status_window:SetText(status)
+        self.displayed_status = status
+    end
+    self.status_window:Show(self.inventory_open and status ~= "")
+end
+
+function part_at(name)
+    if type(name) ~= "string" then return nil end
+    local normalized = name:lower():gsub("[^%w]", ""):gsub("^bip%d+", "")
+    if normalized:match("^spine%d*$") or normalized == "chest" or normalized == "torso" then return "ribs" end
+    local side, limb = normalized:match("^([lr])([%a]+)")
+    limb = limb_names[limb]
+    if limb then return (side == "l" and "left_" or "right_") .. limb end
+end
+
+function adapter:attempt(part, cause, power)
+    if part and type(power) == "number" and power >= self.config.causes[cause].threshold
+        and not self.state.fractures[part] and self.state:injure(part, cause, power, math.random()) then
+        self:sprint(self.state:effects().sprint_block)
+        self.hint(part_name(part) .. translate("st_field_medical_fractured", " fractured."))
+        self:refresh_status()
+    end
+end
+
+function adapter:land(power)
+    if not self.enabled or type(power) ~= "number" or power < self.config.causes.fall.threshold then return end
+    self:attempt(math.random() < 0.5 and "left_leg" or "right_leg", "fall", power)
+end
+
+function adapter:part(actor, bone)
+    if type(bone) == "number" and bone >= 0 and bone < 65535 and self.method(actor, "bone_name") then
+        return part_at(actor:bone_name(bone))
+    end
+end
+
+function adapter:hit(actor, data, part, outcome, raw_power)
+    if not self.enabled or not part then return end
+    local power, kind, cause = data.power, data.type
+    if kind == hit.fire_wound then
+        if outcome == "stopped" then
+            cause, power = "blocked", math.max(power, (raw_power or 0) * self.config.blocked_raw_power_fraction)
+        elseif outcome == "penetrated" then
+            cause = "penetrating"
+        end
+    elseif kind == hit.wound or (hit.wound_2 and kind == hit.wound_2) then
+        local source = data.draftsman
+        cause = self.method(source, "is_monster") and source:is_monster() and "mutant" or "penetrating"
+    elseif (hit.strike and kind == hit.strike) or (hit.explosion and kind == hit.explosion) then
+        local source = data.draftsman
+        if source and self.method(source, "id") and source:id() == actor:id() then return end
+        cause = self.method(source, "is_monster") and source:is_monster() and "mutant" or "blunt"
+    end
+    if cause then self:attempt(part, cause, power) end
+end
+
+function adapter:can_use(item)
+    if item and self.treatments[item:section()] and (not self.enabled or not self.state:splint_target()) then
+        self.hint(translate("st_field_medical_no_splint", "No unsplinted arm or leg fracture."))
+        return false
+    end
+    return true
+end
+
+function adapter:use(item)
+    local treatment = item and self.treatments[item:section()]
+    if treatment and self.enabled then
+        local part = self.state:splint()
+        if part then self.hint(part_name(part) .. translate("st_field_medical_splinted_notice", " splinted.")) end
+        self:refresh_status()
+        self:sprint(self:combined_effects().sprint_block)
+    end
+end
+
+function adapter:doctor()
+    self.state:doctor()
+    self:sprint(false)
+    self:restore_sway()
+    self:refresh_status()
+end
+
+function adapter:sprint(block)
+    if block == (self.sprint_block == true) then return end
+    self.sprint_block = block
+    local actor = self.actor
+    if not actor or not self.method(actor, "allow_sprint") then return end
+    actor:allow_sprint(not block)
+end
+
+function adapter:restore_sway()
+    if self.sway_active and self.method(self.actor, "set_zoom_inertion_factor") then
+        self.actor:set_zoom_inertion_factor(1)
+    end
+    self.sway_active = false
+end
+
+function adapter:combined_effects()
+    local effects = self.state:effects()
+    if not self.tourniquets then return effects end
+    local extra = self.tourniquets:effects()
+    effects.movement = math.max(0.25, effects.movement * extra.movement)
+    effects.reload = math.max(0.20, effects.reload * extra.reload)
+    effects.stamina = effects.stamina * extra.stamina
+    effects.regeneration = effects.regeneration * extra.regeneration
+    effects.sprint_block = effects.sprint_block or extra.sprint_block
+    effects.sway = math.min(2, math.max(effects.sway, extra.sway))
+    if extra.limp > effects.limp then
+        effects.limp, effects.limp_side = extra.limp, extra.limp_side
+    end
+    return effects
+end
+
+function adapter:effects()
+    local effects = self:combined_effects()
+    self:sprint(effects.sprint_block)
+    if effects.sway > 1 and self.method(self.actor, "set_zoom_inertion_factor") then
+        -- The native ADS effector exists only while aiming.
+        self.actor:set_zoom_inertion_factor(effects.sway)
+        self.sway_active = true
+    else
+        self:restore_sway()
+    end
+    self:refresh_status()
+    return effects
+end
+
+function adapter:apply_power(conditions, cap, regeneration)
+    local power = conditions:GetPower()
+    local adjusted = power
+    if self.last_power and power > self.last_power and regeneration < 1 then
+        adjusted = self.last_power + (power - self.last_power) * regeneration
+    end
+    adjusted = math.min(adjusted, cap)
+    if adjusted ~= power then conditions:SetPower(adjusted) end
+    self.last_power = adjusted
+end
+
+function adapter:footstep(hud_view)
+    if hud_view ~= true or not level.add_cam_effector then return end
+    local effect = self:combined_effects()
+    local now = time_global()
+    if effect.limp <= 0 or (self.limp_until and now < self.limp_until
+        and self.limp_until - now <= self.config.limp_interval) then return end
+    level.add_cam_effector("camera_effects\\field_medical_limp_" .. effect.limp_side .. ".anm",
+        self.config.limp_effector, false, "", 0, false, effect.limp)
+    self.limp_until = now + self.config.limp_interval
+end
+
+local function animation_speed(ini, item, name)
+    local section = item:section()
+    if not ini:line_exist(section, "hud") then return 1 end
+    local hud = ini:r_string(section, "hud")
+    if not ini:section_exist(hud) or not ini:line_exist(hud, name) then return 1 end
+    local source = ini:r_string(hud, name)
+    local speed = tonumber(source:match("^[^,]*,[^,]*,%s*([^,]+)"))
+    return speed and speed > 0 and speed or 1
+end
+
+function adapter:animation(data, item)
+    local active = self.actor:active_item()
+    if not data or not item or not active or item:id() ~= active:id() or not self.method(item, "cast_Weapon")
+        or not item:cast_Weapon() then return end
+    local scale = self:combined_effects().reload
+    local name, speed = data.anm_name, data.anm_speed
+    -- CWeapon::eReload == 7, including tri-state shotgun open/add/close clips.
+    if scale == 1 or type(name) ~= "string" or type(speed) ~= "number" or speed <= 0
+        or (data.anm_state ~= 7 and not name:match("^anm_reload")) then return end
+    if speed == 1 then speed = animation_speed(self.native, item, name) end
+    data.anm_speed = speed * scale
+end
+
+function adapter:clear_effects()
+    self:sprint(false)
+    self:restore_sway()
+    if self.limp_until and level.remove_cam_effector then
+        level.remove_cam_effector(self.config.limp_effector)
+    end
+    self.limp_until, self.last_power = nil, nil
+    self.inventory_open = false
+    self:refresh_status()
+end

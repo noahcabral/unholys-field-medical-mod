@@ -1,0 +1,265 @@
+-- Pure state transitions. No engine objects, file IO, or implicit clocks.
+local State = {}
+State.__index = State
+
+local function number(value, fallback)
+    if type(value) == "number" and value == value and math.abs(value) < math.huge then
+        return value
+    end
+    return fallback
+end
+
+local function clamp(value, low, high)
+    return math.max(low, math.min(value, high))
+end
+
+local function medkit_units(config, severity)
+    return math.max(0.01, number(config.medkit_minimum_units, 1))
+        + severity * math.max(0, number(config.medkit_severity_units, 3))
+end
+
+function new(config, health, snapshot)
+    local state = setmetatable({
+        config = config,
+        blood = clamp(number(health, 1), 0, 1),
+        wounds = {},
+        epinephrine_seconds = 0,
+        faint_seconds = 0,
+        fainted_at_critical = false,
+    }, State)
+    if type(snapshot) == "table" and snapshot.version == 1 then
+        state.blood = clamp(number(snapshot.blood, state.blood), 0, 1)
+        state.faint_seconds = clamp(number(snapshot.faint_seconds, 0), 0, config.faint_seconds)
+        state.epinephrine_seconds = math.max(0, number(snapshot.epinephrine_seconds, 0))
+        state.fainted_at_critical = snapshot.fainted_at_critical == true
+        if type(snapshot.wounds) == "table" then
+            for _, wound in ipairs(snapshot.wounds) do
+                if type(wound) == "table" and number(wound.severity, 0) > 0 then
+                    local treatment = wound.treatment
+                    if treatment ~= "bandaged" and treatment ~= "stable" then treatment = "open" end
+                    local remaining = clamp(number(wound.stable_seconds, config.stabilization_seconds),
+                        0, config.stabilization_seconds)
+                    local needs_dressing = wound.needs_dressing == true
+                    if treatment == "stable" and remaining == 0 then
+                        treatment, needs_dressing = "open", true
+                    end
+                    local severity = clamp(wound.severity, 0, 1)
+                    state.wounds[#state.wounds + 1] = {
+                        severity = severity,
+                        part = type(wound.part) == "string" and wound.part or nil,
+                        treatment = treatment,
+                        stable_seconds = treatment == "stable" and remaining or nil,
+                        needs_dressing = needs_dressing,
+                        stabilization_progress = treatment ~= "stable" and not needs_dressing
+                            and clamp(number(wound.stabilization_progress, 0), 0, medkit_units(config, severity)) or 0,
+                    }
+                end
+            end
+        end
+    end
+    return state
+end
+
+function State:snapshot()
+    local wounds = {}
+    for i, wound in ipairs(self.wounds) do
+        wounds[i] = {
+            severity = wound.severity,
+            part = wound.part,
+            treatment = wound.treatment,
+            stable_seconds = wound.stable_seconds,
+            needs_dressing = wound.needs_dressing,
+            stabilization_progress = wound.stabilization_progress,
+        }
+    end
+    return {
+        version = 1,
+        blood = self.blood,
+        wounds = wounds,
+        epinephrine_seconds = self.epinephrine_seconds,
+        faint_seconds = self.faint_seconds,
+        fainted_at_critical = self.fainted_at_critical,
+    }
+end
+
+function State:add_wound(severity, part)
+    severity = clamp(number(severity, 0), 0, 1)
+    if severity <= 0 or self.blood <= 0 then return false end
+    self.wounds[#self.wounds + 1] = {
+        severity = severity,
+        part = type(part) == "string" and part or nil,
+        treatment = "open",
+        stabilization_progress = 0,
+    }
+    return true
+end
+
+function State:penetrating_hit(resolved_power, penetration, part)
+    -- Unknown ballistic outcomes are owned by the adapter's fallback.
+    -- Only an affirmative penetration creates a wound.
+    local damage = number(resolved_power, 0)
+    if penetration ~= "penetrated" or damage <= 0 then return false end
+    return self:add_wound(damage / self.config.severe_hit_power, part)
+end
+
+function State:bleeding_rate(tourniquets)
+    local c = self.config
+    local rate = 0
+    for _, wound in ipairs(self.wounds) do
+        if wound.treatment ~= "stable" and not (tourniquets and tourniquets:blocks(wound.part)) then
+            local wound_rate = c.minimum_bleed + c.severe_bleed * wound.severity ^ c.bleed_exponent
+            rate = rate + wound_rate * (wound.treatment == "bandaged" and c.bandage_bleed_fraction or 1)
+        end
+    end
+    return math.min(c.max_total_bleed, rate)
+end
+
+function State:bandage()
+    if self.blood <= 0 then return 0 end
+    local most_severe
+    for _, wound in ipairs(self.wounds) do
+        if wound.treatment == "open" and (not most_severe or wound.severity > most_severe.severity) then
+            most_severe = wound
+        end
+    end
+    if not most_severe then return 0 end
+    most_severe.treatment = "bandaged"
+    most_severe.needs_dressing = false
+    return 1
+end
+
+function State:medkit(capacity)
+    if self.blood <= 0 then return 0, 0 end
+    local remaining = math.max(0, number(capacity, number(self.config.medkit_default_capacity, 2)))
+    local eligible = {}
+    for _, wound in ipairs(self.wounds) do
+        if wound.treatment ~= "stable" and not wound.needs_dressing then
+            eligible[#eligible + 1] = {wound = wound, index = #eligible + 1}
+        end
+    end
+    table.sort(eligible, function(a, b)
+        local a_started = a.wound.stabilization_progress > 0
+        local b_started = b.wound.stabilization_progress > 0
+        if a_started ~= b_started then return a_started end
+        if a.wound.severity ~= b.wound.severity then return a.wound.severity > b.wound.severity end
+        return a.index < b.index
+    end)
+    local treated = 0
+    local used = 0
+    for _, entry in ipairs(eligible) do
+        if remaining <= 0 then break end
+        local wound = entry.wound
+        local threshold = medkit_units(self.config, wound.severity)
+        local applied = math.min(remaining, math.max(0, threshold - wound.stabilization_progress))
+        wound.stabilization_progress = wound.stabilization_progress + applied
+        remaining, used = remaining - applied, used + applied
+        if wound.stabilization_progress + 1e-9 >= threshold then
+            wound.treatment = "stable"
+            wound.stable_seconds = self.config.stabilization_seconds
+            wound.stabilization_progress = 0
+            treated = treated + 1
+        end
+    end
+    return treated, used
+end
+
+function State:deduct_blood(amount)
+    local deducted = clamp(number(amount, 0), 0, self.blood)
+    self.blood = self.blood - deducted
+    return deducted
+end
+
+function State:epinephrine(seconds)
+    seconds = math.max(0, number(seconds, number(self.config.epinephrine_seconds, 90)))
+    if self.blood <= 0 or seconds == 0 then return false end
+    self.epinephrine_seconds = math.max(self.epinephrine_seconds, seconds)
+    return true
+end
+
+function State:doctor()
+    if self.blood <= 0 then return 0 end
+    local closed = #self.wounds
+    self.wounds = {}
+    return closed
+end
+
+function State:observe_health(health)
+    -- Vanilla radiation, burns, falls, and other systemic damage still matter.
+    -- Increases outside rest do not replenish blood.
+    self.blood = math.min(self.blood, clamp(number(health, self.blood), 0, 1))
+end
+
+local function advance(state, seconds, rest_per_second, tourniquets)
+    local remaining = seconds
+    while remaining > 0 and state.blood > 0 do
+        -- Integrate both sides of a dressing expiry, even during a sleep skip.
+        local slice = remaining
+        local next_expiry = tourniquets and tourniquets:next_expiry()
+        if next_expiry then slice = math.min(slice, next_expiry) end
+        for _, wound in ipairs(state.wounds) do
+            if wound.stable_seconds then slice = math.min(slice, wound.stable_seconds) end
+        end
+        local bleeding = state:bleeding_rate(tourniquets)
+        if bleeding > 0 then
+            state.blood = math.max(0, state.blood - bleeding * slice)
+        elseif rest_per_second then
+            local ceiling = #state.wounds > 0 and state.config.recovery_cap_with_wounds or 1
+            state.blood = math.max(state.blood, math.min(ceiling, state.blood + rest_per_second * slice))
+        end
+        for _, wound in ipairs(state.wounds) do
+            if wound.stable_seconds then
+                wound.stable_seconds = wound.stable_seconds - slice
+                if wound.stable_seconds <= 0 then
+                    wound.stable_seconds = nil
+                    wound.treatment, wound.needs_dressing = "open", true
+                end
+            end
+        end
+        if tourniquets then tourniquets:advance(slice) end
+        state.epinephrine_seconds = math.max(0, state.epinephrine_seconds - slice)
+        remaining = remaining - slice
+    end
+end
+
+function State:tick(seconds, tourniquets)
+    seconds = math.max(0, number(seconds, 0))
+    advance(self, seconds, nil, tourniquets)
+    self.faint_seconds = math.max(0, self.faint_seconds - seconds)
+    if self.blood <= 0 then
+        self.faint_seconds = 0
+    elseif self.blood <= self.config.faint_at and not self.fainted_at_critical and self.epinephrine_seconds <= 0 then
+        self.fainted_at_critical = true
+        self.faint_seconds = self.config.faint_seconds
+    end
+end
+
+function State:sleep(hours, nutrition, hydration, tourniquets)
+    if self.blood <= 0 then return 0 end
+    local c = self.config
+    hours = clamp(number(hours, 0), 0, c.max_sleep_hours)
+    if hours == 0 then return 0 end
+    local before = self.blood
+    local food = clamp(number(nutrition, c.unknown_nutrition), 0, 1)
+    local water = clamp(number(hydration, c.unknown_hydration), 0, 1)
+    local support = (food * c.nutrition_weight + water * c.hydration_weight)
+        / (c.nutrition_weight + c.hydration_weight)
+    local recovery = c.rest_blood_per_hour * (c.minimum_rest_fraction + (1 - c.minimum_rest_fraction) * support)
+    advance(self, hours * c.sleep_bleed_seconds_per_hour, recovery / c.sleep_bleed_seconds_per_hour, tourniquets)
+    self.faint_seconds = 0
+    if self.blood > c.faint_at then self.fainted_at_critical = false end
+    return self.blood - before
+end
+
+function State:effects()
+    local c = self.config
+    local suppress = self.epinephrine_seconds > 0 and self.blood > 0
+    local severity = suppress and 0
+        or clamp((c.impairment_starts_at - self.blood) / (c.impairment_starts_at - c.faint_at), 0, 1)
+    return {
+        stamina = 1 - severity * c.stamina_penalty,
+        movement = 1 - severity * c.movement_penalty,
+        recoil = 1 + severity * c.recoil_penalty,
+        vision = severity * c.vision_penalty,
+        unconscious = not suppress and self.faint_seconds > 0,
+    }
+end

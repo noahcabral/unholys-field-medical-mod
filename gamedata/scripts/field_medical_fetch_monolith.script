@@ -1,0 +1,184 @@
+-- Keep generated requests separate from authored item dependencies.
+local reward_suffix = "_field_medical_fetch_reward"
+local skinflint_task = "mil_smart_terrain_7_10_freedom_trader_stalker_task_5"
+local authored_rewards = {
+    lttz_ms_runaway = {yadylin = "medkit"},
+    lttz_ms_needle_haystack = {stimpack_army = "medkit_army"},
+    cs_story_task0 = {tetanus = "adrenalin"},
+    cs_story_task1 = {salicidic_acid = "bandage", tetanus = "adrenalin"},
+    cs_story_task2 = {drug_anabiotic = "medkit"},
+}
+
+local function is_random_fetch(key)
+    local id = type(key) == "string" and key:match("^(.-)_fetch$")
+    local ini = task_manager and task_manager.task_ini
+    if not id or not ini then return false end
+    local rule = ini:r_string_ex(id, "fetch_func")
+    return rule and rule:find("setup_fetch_task(" .. key .. ":", 1, true) ~= nil
+end
+
+local function replacement(policy, key, section)
+    if policy and policy.fetch_replacement and policy:is_blocked(section) and is_random_fetch(key) then
+        return policy.fetch_replacement
+    end
+    return section
+end
+
+local function record_reward(actor, key, original, item)
+    if original and original ~= item then
+        save_var(actor, key .. reward_suffix, original .. "/" .. item)
+    else
+        save_var(actor, key .. reward_suffix, nil)
+    end
+end
+
+function filter_candidates(policy, pool)
+    if not policy or type(pool) ~= "table" then return pool end
+    local filtered
+    for section in pairs(pool) do
+        if policy:is_blocked(section) then
+            if not filtered then
+                filtered = {}
+                for item, tier in pairs(pool) do filtered[item] = tier end
+            end
+            filtered[section] = nil
+        end
+    end
+    if not filtered then return pool end
+    if not next(filtered) and policy.fetch_replacement then
+        filtered[policy.fetch_replacement] = 0
+    end
+    return filtered
+end
+
+-- Romeo keeps already-offered entries in a per-giver table. Migrate that
+-- record before dialogue publishes the offer and saves the actor requirement.
+function prepare_offer(policy, actor, key, offer)
+    local old = offer.sec
+    local item = replacement(policy, key, old)
+    if item ~= old then
+        offer.field_medical_original = offer.field_medical_original or old
+        offer.sec = item
+    end
+    if policy and actor then record_reward(actor, key, offer.field_medical_original, item) end
+    return item
+end
+
+function clear_reward(policy, actor, key)
+    if policy and actor then save_var(actor, key .. reward_suffix, nil) end
+end
+
+function normalize_requirement(policy, actor, key)
+    if not actor then return nil end
+    local old = load_var(actor, key)
+    local item = replacement(policy, key, old)
+    if item ~= old then
+        record_reward(actor, key, old, item)
+        save_var(actor, key, item)
+    end
+    return item
+end
+
+function reward_section(policy, actor, key, section)
+    local reward = policy and actor and load_var(actor, key .. reward_suffix)
+    if type(reward) == "string" then
+        local original, item = reward:match("^([^/]+)/(.+)$")
+        if original and item == section and policy.native:section_exist(original) then return original end
+    elseif type(reward) == "table" and reward.item == section and type(reward.original) == "string"
+        and policy.native:section_exist(reward.original) then
+        return reward.original
+    end
+    return section
+end
+
+local function allowed_section(policy, section)
+    return policy.allowed[section] and policy.native:section_exist(section) and section
+end
+
+function fixed_reward_rule(policy, id, rule)
+    local replacements = authored_rewards[id]
+    if not (policy and replacements and rule) then return rule end
+    return (rule:gsub("(=reward_[%w_]+)(%s*%(%s*)([%w_]+)(%s*%))", function(effect, open, section, close)
+        local preferred = replacements[section]
+        if not preferred or not policy:is_blocked(section)
+            or (effect ~= "=reward_item" and effect ~= "=reward_random_item") then return end
+        local replacement = allowed_section(policy, preferred) or policy.fetch_replacement
+        if replacement then return effect .. open .. replacement .. close end
+    end))
+end
+
+local function skinflint_replacement(policy)
+    if policy and policy:is_blocked("cocaine") then
+        -- These treatments are distinct from the other required and optional items.
+        return allowed_section(policy, "adrenalin") or allowed_section(policy, "bandage")
+            or allowed_section(policy, "medkit")
+    end
+end
+
+function normalize_multifetch(policy, id, record, saved)
+    if id ~= skinflint_task or not record then return end
+    local replacement = skinflint_replacement(policy)
+    local name = replacement and policy.native:r_string_ex(replacement, "inv_name")
+    if not name then return end
+    for _, entry in ipairs(record.optional_items or {}) do
+        if entry.sec == "cocaine" then
+            entry.sec = replacement
+            entry.iname = name
+            -- The stock eligibility and removal paths use different keys.
+            entry.condition = entry.condition or entry.cond
+            if saved then entry.field_medical_previous_section = "cocaine" end
+        end
+    end
+end
+
+function multifetch_options(actor, entries)
+    local options = {}
+    for _, entry in ipairs(entries) do
+        local previous = entry.field_medical_previous_section
+        local previous_count = 0
+        if previous then
+            local min_condition = entry.cond or -1
+            actor:iterate_inventory(function(_, item)
+                if item:section() == previous and item:condition() > min_condition then
+                    previous_count = previous_count + 1
+                    return previous_count >= entry.num
+                end
+            end, actor)
+        end
+        -- Preserve already-collected bonus items from an active save, including
+        -- when the player has a mix of the old and the new item.
+        if previous_count > 0 then
+            local old = {}
+            for key, value in pairs(entry) do old[key] = value end
+            old.sec = previous
+            old.num = previous_count
+            options[#options + 1] = old
+        end
+        if previous_count < entry.num then
+            local current = {}
+            for key, value in pairs(entry) do current[key] = value end
+            current.num = entry.num - previous_count
+            options[#options + 1] = current
+        end
+    end
+    return options
+end
+
+function quest_offer_text(policy, id, text)
+    if id == skinflint_task and skinflint_replacement(policy) then
+        return (text:gsub("some cocaine and some porn mags", "some extra medical supplies and some porn mags"))
+    end
+    return text
+end
+
+function migrate_accepted(policy, actor)
+    if not actor or not task_manager or not task_manager.get_task_manager then return end
+    local manager = task_manager.get_task_manager()
+    local records = manager and manager.task_info
+    if not records then return end
+    for id, record in pairs(records) do
+        if type(id) == "string" and record.last_check_task ~= "complete" and record.last_check_task ~= "fail" then
+            normalize_requirement(policy, actor, id .. "_fetch")
+        end
+    end
+end

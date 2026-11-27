@@ -1,0 +1,151 @@
+; Health and all the rates below are fractions of full blood volume.
+[blood]
+severe_hit_power              = 0.35
+minimum_bleed                 = 0.00035
+severe_bleed                  = 0.015
+bleed_exponent                = 1.25
+max_total_bleed               = 0.06
+bandage_bleed_fraction        = 0.35
+stabilization_seconds         = 300
+medkit_minimum_units           = 1
+medkit_severity_units          = 3
+medkit_default_capacity        = 2
+epinephrine_seconds            = 90
+rest_blood_per_hour           = 0.055
+minimum_rest_fraction         = 0.22
+recovery_cap_with_wounds       = 0.90
+max_sleep_hours               = 24
+sleep_bleed_seconds_per_hour  = 60
+unknown_nutrition             = 0.65
+unknown_hydration             = 0.70
+nutrition_weight              = 1
+hydration_weight              = 1
+impairment_starts_at           = 0.74
+faint_at                      = 0.16
+faint_seconds                 = 8
+stamina_penalty               = 0.88
+movement_penalty              = 0.46
+recoil_penalty                = 0.70
+vision_penalty                = 0.72
+
+[monolith]
+; Actor medical state is updated in real seconds. Oversized frames are capped.
+update_interval_milliseconds  = 120
+max_tick_seconds              = 0.8
+bullet_memory_milliseconds    = 180000
+vision_effector               = yantar_underground_psi.ppe
+vision_effector_id            = 613742
+doctor_injury_fee             = 1850
+doctor_injury_radiation_fee   = 3350
+combat_input_block            = true
+; Weapon IDs with no readable cartridge AP are left to vanilla impact damage
+; when armor covers the impacted bone. No custom wound is inferred from damage.
+
+[bandages]
+bandage                       = true
+
+[medkits]
+medkit                        = 2
+medkit_army                   = 4
+medkit_scientic               = 7
+medkit_elite                  = 9
+
+[epinephrine]
+adrenalin                     = true
+stimpack                      = true
+
+[tourniquet]
+enabled                       = false
+duration_seconds              = 600
+arm_blood_fraction            = 0.08
+leg_blood_fraction            = 0.14
+arm_integrity_loss_per_second = 0.0015
+leg_integrity_loss_per_second = 0.0015
+active_minimum_effect          = 0.35
+leg_movement_penalty          = 0.42
+leg_limp_power                = 0.75
+arm_sway_penalty              = 0.85
+arm_reload_penalty            = 0.51
+remove_scan_code              = 20
+modifier_scan_code            = 56
+
+[tourniquets]
+jgut                           = true
+field_medical_tourniquet       = true
+
+[catalog]
+enabled                       = false
+fetch_replacements            = medkit, bandage, medkit_army, medkit_scientic
+
+; Additional medicine sections that a pack labels with a nonmedical kind.
+[catalog_excluded]
+antibio_chlor                 = true
+antibio_sulfad                = true
+antiemetic                    = true
+antirad                       = true
+antirad_cystamine              = true
+antirad_kalium                = true
+analgetic                     = true
+bandage_special               = true
+cocaine                       = true
+drug_anabiotic                = true
+drug_antidot                  = true
+drug_booster                  = true
+drug_coagulant                = true
+drug_psy_blockade             = true
+drug_radioprotector           = true
+drug_sleepingpills            = true
+e_syringe                     = true
+glucose                       = true
+glucose_s                     = true
+morphine                      = true
+salicidic_acid                = true
+stimpack_army                 = true
+tetanus                       = true
+yadylin                       = true
+
+[fractures]
+enabled                       = false
+minimum_severity              = 0.60
+minimum_chance_fraction       = 0.28
+second_limb_fraction          = 0.32
+splinted_penalty_fraction     = 0.35
+leg_movement_penalty          = 0.42
+leg_limp_power                = 0.75
+arm_sway_penalty              = 0.85
+arm_reload_penalty            = 0.51
+ribs_stamina_penalty          = 0.33
+ribs_regen_penalty             = 0.52
+blocked_raw_power_fraction    = 0.52
+limp_interval_milliseconds    = 685
+limp_effector_id               = 613743
+
+; Resolved native damage units for hits, contact speed in m/s for landings.
+; Chance ramps from minimum_chance_fraction to full chance at severe power.
+[fracture_fall]
+threshold                     = 12
+severe                        = 23
+chance                        = 0.50
+
+[fracture_penetrating]
+threshold                     = 0.22
+severe                        = 0.57
+chance                        = 0.48
+
+[fracture_blocked]
+threshold                     = 0.24
+severe                        = 0.52
+chance                        = 0.29
+
+[fracture_mutant]
+threshold                     = 0.19
+severe                        = 0.52
+chance                        = 0.53
+
+[fracture_blunt]
+threshold                     = 0.24
+severe                        = 0.58
+chance                        = 0.46
+
+[fracture_splints]
+field_medical_splint            = true

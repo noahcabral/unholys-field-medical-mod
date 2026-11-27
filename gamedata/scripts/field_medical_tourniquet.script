@@ -1,0 +1,163 @@
+-- Pure game state. Time, wound suppression and blood deductions are owned by the simulation.
+local Controller = {}
+Controller.__index = Controller
+
+local limbs = {"left_arm", "right_arm", "left_leg", "right_leg"}
+local kind = {left_arm = "arm", right_arm = "arm", left_leg = "leg", right_leg = "leg"}
+
+local function number(value, fallback)
+    if type(value) == "number" and value == value and math.abs(value) < math.huge then
+        return value
+    end
+    return fallback
+end
+
+local function clamp(value, lower, upper)
+    return math.max(lower, math.min(value, upper))
+end
+
+function new(settings, snapshot)
+    settings = settings or {}
+    local config = {
+        duration = clamp(number(settings.duration_seconds, 600), 1, 3600),
+        blood = {
+            arm = clamp(number(settings.arm_blood_fraction, .08), 0, .95),
+            leg = clamp(number(settings.leg_blood_fraction, .14), 0, .95),
+        },
+        deterioration = {
+            arm = clamp(number(settings.arm_integrity_loss_per_second, .0015), 0, 1),
+            leg = clamp(number(settings.leg_integrity_loss_per_second, .0015), 0, 1),
+        },
+        initial_effect = clamp(number(settings.active_minimum_effect, .35), 0, 1),
+        movement = clamp(number(settings.leg_movement_penalty, .42), 0, .95),
+        limp = clamp(number(settings.leg_limp_power, .75), 0, 1),
+        sway = clamp(number(settings.arm_sway_penalty, .85), 0, 4),
+        reload = clamp(number(settings.arm_reload_penalty, .51), 0, .95),
+    }
+    local controller = setmetatable({config = config, injuries = {}}, Controller)
+    if type(snapshot) ~= "table" or snapshot.version ~= 1 or type(snapshot.limbs) ~= "table" then
+        return controller
+    end
+    for _, part in ipairs(limbs) do
+        local saved = snapshot.limbs[part]
+        if type(saved) == "table" then
+            local remaining = clamp(number(saved.remaining, 0), 0, config.duration)
+            controller.injuries[part] = {
+                remaining = saved.active == true and remaining or 0,
+                integrity = clamp(number(saved.integrity, 0), 0, 1),
+            }
+        end
+    end
+    return controller
+end
+
+function Controller:can_apply(part, blood)
+    if not kind[part] then return false, "invalid_limb" end
+    local injury = self.injuries[part]
+    if injury then
+        return false, injury.remaining > 0 and "already_applied" or "doctor_required"
+    end
+    if number(blood, 0) <= 0 then return false, "no_blood" end
+    return true
+end
+
+function Controller:apply(part, blood)
+    local allowed, reason = self:can_apply(part, blood)
+    if not allowed then return nil, reason end
+    self.injuries[part] = {remaining = self.config.duration, integrity = 1}
+    return self.config.blood[kind[part]] * clamp(blood, 0, 1)
+end
+
+function Controller:blocks(part)
+    local injury = self.injuries[part]
+    return injury ~= nil and injury.remaining > 0
+end
+
+function Controller:can_remove(part)
+    return self:blocks(part)
+end
+
+function Controller:remove(part)
+    if not self:can_remove(part) then return false end
+    self.injuries[part].remaining = 0
+    return true
+end
+
+function Controller:next_expiry()
+    local earliest
+    for _, injury in pairs(self.injuries) do
+        if injury.remaining > 0 and (not earliest or injury.remaining < earliest) then
+            earliest = injury.remaining
+        end
+    end
+    return earliest
+end
+
+function Controller:advance(seconds)
+    seconds = math.max(0, number(seconds, 0))
+    for part, injury in pairs(self.injuries) do
+        local active_seconds = math.min(seconds, injury.remaining)
+        injury.remaining = injury.remaining - active_seconds
+        injury.integrity = math.max(0, injury.integrity - active_seconds * self.config.deterioration[kind[part]])
+    end
+end
+
+function Controller:status()
+    local status = {}
+    for _, part in ipairs(limbs) do
+        local injury = self.injuries[part]
+        if injury then
+            status[#status + 1] = {
+                part = part,
+                active = injury.remaining > 0,
+                remaining = injury.remaining,
+                integrity = injury.integrity,
+            }
+        end
+    end
+    return status
+end
+
+function Controller:snapshot()
+    local snapshot = {version = 1, limbs = {}}
+    for _, status in ipairs(self:status()) do
+        snapshot.limbs[status.part] = {
+            active = status.active, remaining = status.remaining, integrity = status.integrity,
+        }
+    end
+    return snapshot
+end
+
+function Controller:doctor()
+    local count = #self:status()
+    self.injuries = {}
+    return count
+end
+
+function Controller:effects()
+    local config = self.config
+    local arms, legs, side = 0, 0, nil
+    for _, part in ipairs(limbs) do
+        local injury = self.injuries[part]
+        if injury then
+            local severity = injury.remaining <= 0 and 1
+                or 1 - (1 - config.initial_effect) * injury.integrity
+            if kind[part] == "arm" then
+                arms = math.max(arms, severity)
+            elseif severity > legs then
+                legs = severity
+                side = part == "left_leg" and "left" or "right"
+            end
+        end
+    end
+    return {
+        movement = 1 - config.movement * legs,
+        sprint_block = legs > 0,
+        limp = config.limp * legs,
+        limp_side = side,
+        sway = 1 + config.sway * arms,
+        reload = 1 - config.reload * arms,
+        stamina = 1,
+        regeneration = 1,
+    }
+end

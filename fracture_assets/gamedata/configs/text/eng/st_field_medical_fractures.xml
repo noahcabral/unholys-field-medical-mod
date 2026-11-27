@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+    <string id="st_field_medical_splint"><text>Field splint</text></string>
+    <string id="st_field_medical_splint_desc"><text>Single-use support for the worst untreated arm or leg fracture. Gives some movement or handling back until a doctor can treat the break.</text></string>
+    <string id="st_field_medical_tourniquet"><text>Tourniquet</text></string>
+    <string id="st_field_medical_tourniquet_desc"><text>Stops bleeding in one limb for up to ten minutes at the cost of blood volume and limb function. Use Left Alt + T to remove the tourniquet closest to expiry. A doctor must treat damage from a used tourniquet.</text></string>
+    <string id="st_field_medical_tourniquet_damage"><text>Tourniquet injury, see doctor</text></string>
+    <string id="st_field_medical_epinephrine"><text>Epinephrine</text></string>
+    <string id="st_field_medical_epinephrine_desc"><text>Briefly suppresses symptoms of low blood volume. Gives no blood, stops no bleeding, and leaves limb injuries in effect.</text></string>
+    <string id="st_field_medical_fractures"><text>Fractures</text></string>
+    <string id="st_field_medical_left_leg"><text>Left leg</text></string>
+    <string id="st_field_medical_right_leg"><text>Right leg</text></string>
+    <string id="st_field_medical_left_arm"><text>Left arm</text></string>
+    <string id="st_field_medical_right_arm"><text>Right arm</text></string>
+    <string id="st_field_medical_ribs"><text>Ribs</text></string>
+    <string id="st_field_medical_splinted"><text> (splinted)</text></string>
+    <string id="st_field_medical_splinted_notice"><text> splinted.</text></string>
+    <string id="st_field_medical_fractured"><text> fractured.</text></string>
+    <string id="st_field_medical_no_splint"><text>No unsplinted arm or leg fracture.</text></string>
+</string_table>

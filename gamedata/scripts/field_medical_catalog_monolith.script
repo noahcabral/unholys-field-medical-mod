@@ -1,0 +1,310 @@
+-- Scoped adapters for medical item use and known supply pipelines.
+local catalog = {}
+catalog.__index = catalog
+
+function new(ini, native, active, permit_use, hint, log)
+    if not ini:r_bool("catalog", "enabled") then return nil end
+    local allowed, basic_treatments = {}, {}
+    local roles = {"bandages", "medkits", "epinephrine"}
+    if ini:r_bool("fractures", "enabled") then roles[#roles + 1] = "fracture_splints" end
+    if ini:r_bool("tourniquet", "enabled") then roles[#roles + 1] = "tourniquets" end
+    for _, role in ipairs(roles) do
+        for row = 0, ini:line_count(role) - 1 do
+            local ok, section = ini:r_line(role, row, "", "")
+            if ok then
+                local include
+                if role == "medkits" then
+                    include = ini:r_float(role, section) > 0
+                else
+                    include = ini:r_bool(role, section)
+                end
+                if include then
+                    allowed[section] = true
+                    if role == "medkits" or role == "bandages" then
+                        basic_treatments[#basic_treatments + 1] = section
+                    end
+                end
+            end
+        end
+    end
+    local self = setmetatable({
+        native = native,
+        allowed = allowed,
+        active = active,
+        permit_use = permit_use,
+        hint = hint,
+        log = log,
+        blocked = {},
+        cache = {},
+    }, catalog)
+    for row = 0, ini:line_count("catalog_excluded") - 1 do
+        local ok, section = ini:r_line("catalog_excluded", row, "", "")
+        if ok and ini:r_bool("catalog_excluded", section) then self.blocked[section] = true end
+    end
+    if ini:line_exist("catalog", "fetch_replacements") then
+        for section in ini:r_string("catalog", "fetch_replacements"):gmatch("[%w_]+") do
+            if allowed[section] and native:section_exist(section) then
+                self.fetch_replacement = section
+                break
+            end
+        end
+    end
+    if not self.fetch_replacement then
+        table.sort(basic_treatments)
+        for _, section in ipairs(basic_treatments) do
+            if native:section_exist(section) then self.fetch_replacement = section; break end
+        end
+    end
+    return self
+end
+
+function catalog:is_blocked(section)
+    if type(section) ~= "string" or self.allowed[section] then return false end
+    if self.blocked[section] then return true end
+    local blocked = self.cache[section]
+    if blocked == nil then
+        local ini = self.native
+        blocked = ini:section_exist(section) and ini:line_exist(section, "kind")
+            and ini:r_string(section, "kind") == "i_medical" or false
+        self.cache[section] = blocked
+    end
+    return blocked
+end
+
+function catalog:install_use_gate()
+    local original = _G.CInventory__eat
+    if type(original) ~= "function" then
+        self.log("catalog disabled: native CInventory__eat script gate is unavailable")
+        return false
+    end
+    _G.CInventory__eat = function(item, ...)
+        if not self:can_use(item) then return false end
+        return original(item, ...)
+    end
+    return true
+end
+
+function catalog:can_use(item)
+    if not item or not self.active() then return true end
+    if self:is_blocked(item:section()) then
+        self.hint("This medicine is unavailable with Field Medical.")
+        return false
+    end
+    return self.permit_use(item)
+end
+
+local function filter_loadout(self, container)
+    if not container or not container.cell or not container.Reinit then return 0 end
+    local sections, values, removed, refund = {}, {}, false, 0
+    for _, cell in pairs(container.cell) do
+        if cell.section and cell:IsShown() then
+            local count = cell:CountChilds() + 1
+            local value = tonumber(cell.flags.info) or 0
+            if self:is_blocked(cell.section) then
+                removed = true
+                refund = refund + value * count
+            else
+                for _ = 1, count do
+                    sections[#sections + 1] = cell.section
+                    values[#values + 1] = value
+                end
+            end
+        end
+    end
+    if not removed then return 0 end
+    container:Reinit(sections, values)
+    local label = game.translate_string("st_mm_new_game_points") .. ": "
+    for _, cell in pairs(container.cell) do
+        if cell:IsShown() then
+            local value = tonumber(cell.flags.info) or 0
+            cell.flags.value = value
+            cell.flags.value_str = label .. value
+        end
+    end
+    return refund
+end
+
+local function filter_starting_items(self, screen)
+    if not screen.CC then return end
+    local refund = filter_loadout(self, screen.CC.inventory)
+    filter_loadout(self, screen.CC.loadout)
+    if refund > 0 and screen.points_left and screen.points_used then
+        refund = math.min(refund, screen.points_used)
+        screen.points_used = screen.points_used - refund
+        screen.points_left = screen.points_left + refund
+        screen.text_points_used:SetText(tostring(screen.points_used))
+        screen.text_points_left:SetText(tostring(screen.points_left))
+    end
+end
+
+-- The xrRazom rewrite filters before the random picker. This also covers
+-- items injected by other add-ons afterward and works on unmodified Monolith.
+function catalog:install_loadouts(screen, injector)
+    if injector and type(injector.add_item) == "function" then
+        local original = injector.add_item
+        injector.add_item = function(item, ...)
+            if type(item) == "table" and self:is_blocked(item.section) then return end
+            return original(item, ...)
+        end
+    end
+    if not screen or type(screen.LoadLoadout) ~= "function" then return end
+    local original = screen.LoadLoadout
+    screen.LoadLoadout = function(dialog, ...)
+        original(dialog, ...)
+        filter_starting_items(self, dialog)
+    end
+    if type(screen.OnStartGame) == "function" then
+        local start = screen.OnStartGame
+        screen.OnStartGame = function(dialog, ...)
+            filter_starting_items(self, dialog)
+            return start(dialog, ...)
+        end
+    end
+end
+
+function catalog:install_trade(utils, screen, injector)
+    if utils and type(utils.get_item_trade_status) == "function" then
+        local original = utils.get_item_trade_status
+        utils.get_item_trade_status = function(item, profile, ...)
+            if item and self.active() and self:is_blocked(item:section()) then return 3 end
+            return original(item, profile, ...)
+        end
+    end
+    if injector and type(injector.spawn_items) == "function" then
+        local original = injector.spawn_items
+        injector.spawn_items = function(npc, items, ...)
+            if self.active() and type(items) == "table" then
+                local filtered = {}
+                for section, count in pairs(items) do
+                    if not self:is_blocked(section) then filtered[section] = count end
+                end
+                items = filtered
+            end
+            return original(npc, items, ...)
+        end
+    end
+    local function wrap(checkout, bag)
+        local original = screen and screen[checkout]
+        if type(original) ~= "function" then return end
+        screen[checkout] = function(dialog, ...)
+            local list = self.active() and dialog.CC and dialog.CC[bag]
+            if list and list.indx_id and level and level.object_by_id then
+                for id in pairs(list.indx_id) do
+                    local item = level.object_by_id(id)
+                    if item and self:is_blocked(item:section()) then
+                        self.hint("This medicine is unavailable with Field Medical.")
+                        return
+                    end
+                end
+            end
+            return original(dialog, ...)
+        end
+    end
+    wrap("TMode_Buy", "npc_trade")
+    wrap("TMode_Sell", "actor_trade")
+end
+
+function catalog:install_loot(loot)
+    if not loot or type(loot.roll_item_tiered) ~= "function" then return end
+    local original = loot.roll_item_tiered
+    loot.roll_item_tiered = function(pool, box, single)
+        if type(pool) ~= "table" or not self.active() then return original(pool, box, single) end
+        local filtered = {}
+        for _, section in ipairs(pool) do
+            if not self:is_blocked(section) then filtered[#filtered + 1] = section end
+        end
+        if #filtered == #pool then return original(pool, box, single) end
+        if #filtered > 0 then return original(filtered, box, #filtered == 1) end
+    end
+end
+
+function catalog:install_random_rewards(effects)
+    if not effects or type(effects.reward_random_item) ~= "function" then return end
+    local original = effects.reward_random_item
+    effects.reward_random_item = function(actor, npc, options, ...)
+        if not self.active() or type(options) ~= "table" or #options < 2 then
+            return original(actor, npc, options, ...)
+        end
+        local retained = {}
+        for _, section in ipairs(options) do
+            if not self:is_blocked(section) then retained[#retained + 1] = section end
+        end
+        if #retained == #options then return original(actor, npc, options, ...) end
+        if #retained == 0 and self.fetch_replacement then retained[1] = self.fetch_replacement end
+        return original(actor, npc, retained, ...)
+    end
+end
+
+local function contains_blocked_item(self, list)
+    if type(list) ~= "string" then return false end
+    for entry in list:gmatch("[^,]+") do
+        local section = entry:match("^%s*([%w_]+)")
+        if self:is_blocked(section) then return true end
+    end
+    return false
+end
+
+function catalog:install_crafting(crafter)
+    if not crafter or type(crafter.add_craft_recipe) ~= "function"
+        or type(crafter.remove_craft_recipe) ~= "function" or type(crafter.craft_recipes) ~= "table" then return end
+    local original = crafter.add_craft_recipe
+    crafter.add_craft_recipe = function(recipes, args)
+        if type(recipes) ~= "table" or not self.active() then return original(recipes, args) end
+        local filtered = {}
+        for tool, items in pairs(recipes) do
+            local keep = {}
+            for output, recipes in pairs(items) do
+                if not contains_blocked_item(self, tool) and not contains_blocked_item(self, output) then
+                    local allowed = {}
+                    for _, recipe in ipairs(recipes) do
+                        if not contains_blocked_item(self, recipe) then allowed[#allowed + 1] = recipe end
+                    end
+                    if #allowed > 0 then keep[output] = allowed end
+                end
+            end
+            if next(keep) then filtered[tool] = keep end
+        end
+        return original(filtered, args)
+    end
+end
+
+function catalog:filter_crafting(crafter)
+    if not crafter or type(crafter.craft_recipes) ~= "table" or type(crafter.remove_craft_recipe) ~= "function" then return end
+    local remove = {}
+    for tool, items in pairs(crafter.craft_recipes) do
+        for output, recipes in pairs(items) do
+            local exclude = contains_blocked_item(self, tool) or contains_blocked_item(self, output)
+            local rejected = {}
+            for _, recipe in ipairs(recipes) do
+                if exclude or contains_blocked_item(self, recipe) then
+                    rejected[#rejected + 1] = recipe
+                end
+            end
+            if #rejected > 0 then
+                remove[tool] = remove[tool] or {}
+                remove[tool][output] = rejected
+            end
+        end
+    end
+    if next(remove) then crafter.remove_craft_recipe(remove) end
+end
+
+function catalog:filter_npc_inventory(npc, release, method, story_id)
+    local actor = self.active()
+    if not actor or not npc or not release or not story_id or not method(npc, "iterate_inventory")
+        or npc:id() == actor:id() then return end
+    local rejected = {}
+    npc:iterate_inventory(function(_, item)
+        if item then
+            local id, section = item:id(), item:section()
+            local quest = self.native:section_exist(section)
+                and self.native:line_exist(section, "quest_item") and self.native:r_bool(section, "quest_item")
+            if id and self:is_blocked(section) and not quest and not story_id(id) then
+                rejected[#rejected + 1] = id
+            end
+        end
+        return false
+    end, npc)
+    -- Collect first so deletion never invalidates the engine's inventory iterator.
+    for _, id in ipairs(rejected) do release(id) end
+end
