@@ -108,11 +108,16 @@ end
 
 function adapter:menu(mode)
     self.inventory_open = mode == 1
-    if self.inventory_open and not self.status_window and ActorMenu and ActorMenu.get_actor_menu
-        and CScriptXmlInit and getFS
+    if self.inventory_open and CScriptXmlInit and getFS
         and getFS():exist("$game_config$", "ui\\field_medical_fractures.xml") then
-        local parent = ActorMenu.get_actor_menu()
-        if parent then
+        -- The scripted inventory changes the mode before showing its own window.
+        local scripted = ui_inventory
+        local parent = scripted and scripted.is_enabled and scripted.is_enabled() and scripted.GUI
+        if not parent and ActorMenu and ActorMenu.get_actor_menu then
+            parent = ActorMenu.get_actor_menu()
+        end
+        if parent and parent ~= self.menu_window then
+            self:close_menu()
             local xml = CScriptXmlInit()
             xml:ParseFile("field_medical_fractures.xml")
             self.menu_window = parent

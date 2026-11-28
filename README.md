@@ -4,4 +4,6 @@ PAHTK is a standalone S.T.A.L.K.E.R. medical overhaul built around blood loss. H
 
 Fractures and tourniquet injuries affect movement, stamina, and weapon handling. Splints stabilize fractures, and doctors close wounds and restore injured limbs. The inventory shows injuries and active tourniquet timers.
 
+![An active left-arm tourniquet and its remaining time in the Romeo inventory](media/tourniquet-status.png)
+
 Pairs well with [Unholy's Trilogy Economy Mod](https://github.com/noahcabral/unholys-trilogy-economy-mod).

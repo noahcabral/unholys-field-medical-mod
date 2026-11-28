@@ -1,0 +1,17 @@
+; PAHTK Romeo compatibility with the stock xrRazom/GAMMA inventory.
+; Keep the Grok protection and outfit functions available for the inventory.
+; Mask its startup field so the module cannot inherit an initializer.
+
+[grok_actor_damage_balancer]
+from_1 = "function on_game_start()"
+to_1 = "on_game_start = false local function paused_for_pahtk()"
+
+; The radiation meter and difficulty menu should see the damage balancer
+; as disabled even though its inventory stat calculators still load.
+[wd_geiger]
+from_1 = "if not grok_actor_damage_balancer then"
+to_1 = "if not (grok_actor_damage_balancer and grok_actor_damage_balancer.on_game_start) then"
+
+[ui_options]
+from_1 = "if grok_actor_damage_balancer then"
+to_1 = "if grok_actor_damage_balancer and grok_actor_damage_balancer.on_game_start then"
